@@ -79,6 +79,8 @@ also tries the unescaped form.
 
 ## How it works
 
+![How a docid is computed from a URL: the same bytes are hashed twice with Bob Jenkins' lookup2 (seeds 0 and 102072) and the two 32-bit halves are concatenated into the 64-bit docid.](docid.png)
+
 Google's `Fingerprint(s)` computes two 32-bit lookup2 hashes of the same bytes with two seeds and
 concatenates them:
 
