@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this research or code, please cite it as below."
+title: "Google DocID Research: Calculating Google's Internal Document Identifiers from URLs"
+type: software
+authors:
+  - family-names: "de Segonzac"
+    given-names: "Olivier"
+    affiliation: "Resoneo"
+repository-code: "https://github.com/OliSeg/google-docid-research"
+url: "https://think.resoneo.com"
+abstract: >-
+  Google Search docids are Google's legacy Fingerprint() of the exact URL string
+  (two Jenkins lookup2 hashes with seeds 0 and 102072). Empirical validation on
+  Google Search, Images, Discover and News data, and a tested Python implementation.
+keywords:
+  - google-search
+  - docid
+  - fingerprint
+  - reverse-engineering
+  - technical-seo
+license: MIT
+version: 1.0.0
+date-released: "2026-10-17"
