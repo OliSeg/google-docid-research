@@ -31,9 +31,12 @@ browsers and apps. Are they arbitrary internal numbers, or can they be computed 
    values), Google News article docids and the docids listed in a live Search results page.
 3. **[Validated]** The input is the exact URL string. Each written form of an address has its own
    docid; non-ASCII characters are hashed in percent-encoded UTF-8 form.
-4. **[Observed]** Several Google identifiers are *not* URL fingerprints: Shopping offer and product IDs,
+4. **[Validated]** The 14 bits that follow the docid in Images and Discover page IDs are a checksum of
+   the docid: the XOR of its four byte pairs, with one fixed bit flipped. It reproduces 58,137 of 58,146
+   held-out observations and all 5,194 IDs read in Google pages. Image IDs use the same format.
+5. **[Observed]** Several Google identifiers are *not* URL fingerprints: Shopping offer and product IDs,
    Maps place IDs, and the identifiers Gemini attached to its sources.
-5. **[Observed]** In Gemini, the identifier of a cited page was issued anew for each response, even for an
+6. **[Observed]** In Gemini, the identifier of a cited page was issued anew for each response, even for an
    unchanged page and even when the same question was asked again (0 of 582 regenerated responses
    reused an identifier, 72 of them less than an hour apart).
 
@@ -108,15 +111,14 @@ probability near 2<sup>-64</sup> per pair.
 | unsigned decimal | Search and Discover data | `9301487375180519679` |
 | signed decimal (two's complement int64) | Gemini source identifiers, some Shopping data | `-9145256698529031937` |
 | hexadecimal | — | `8115857c806a58ff` |
-| 8 bytes little-endian, URL-safe base64, inside a 14-character page ID | Google Images (`data-ref-docid`), Discover | `_1hqgHyFFY…` |
+| 14-character page ID: 8 bytes little-endian, 14-bit checksum, `M`, in URL-safe base64 | Google Images (`data-ref-docid`), Discover | `_1hqgHyFFYH93M` |
 
 `signed = unsigned − 2^64` when `unsigned ≥ 2^63`. The tool prints all forms and `decode` reads any of
 them.
 
-The 14-character page ID holds 13 base64 characters of data (78 bits) and a final character that was `M`
-in all 183 IDs we checked. The first 64 bits are the docid, little-endian. **[Observed]** The remaining 14
-bits are identical for all images of the same page (7 images of one page, same value), differ between
-pages of the same site, and are not reproduced from the docid or the URL by any function we tested.
+The 14-character page ID holds 13 base64 characters of data (78 bits) and a final character that is
+always `M` (all 72,731 distinct page and image IDs of our corpus). The first 64 bits are the docid,
+little-endian. The next 14 bits are a checksum of the docid (section 3.3).
 
 ### 3.2 Signed bytes and non-ASCII URLs
 
@@ -132,6 +134,52 @@ full word contains a byte ≥ 0x80.
 - **Consequence.** In practice, URLs are hashed as percent-encoded ASCII and the byte-reading question does
   not arise. The implementation follows `gutil` (signed words) and keeps an unsigned option for
   experiments (`fingerprint(..., signed_bytes=False)`).
+
+### 3.3 The page ID checksum
+
+**[Validated]** With `b0` to `b7` the docid bytes, least significant first:
+
+```text
+checksum = ((b0 ^ b2 ^ b4 ^ b6 ^ 1) << 6) | ((b1 ^ b3 ^ b5 ^ b7) >> 2)
+```
+
+This is the XOR of the four 16-bit words `b0b1`, `b2b3`, `b4b5`, `b6b7`, with bit 8 flipped, keeping the
+top 14 bits. Example: `https://en.wikipedia.org/wiki/Lockheed_Martin_F-22_Raptor` has docid
+4759174829743600142 and page ID `DvLY3kr8C0KWkM`, the value read on a live Google Images page.
+
+**How we found it.** The extra bits behaved like a property of the page: one value for every image of a
+page, different values for pages of one site. No hash of the URL reproduced them (lookup2 with all
+2<sup>32</sup> seeds, CRC32, Adler-32, MD5, SHA-1, SHA-256, MurmurHash3). In a CRC or an XOR checksum, each
+output bit is an XOR of input bits, so we tested whether each of the 14 bits is an affine function of the
+64 docid bits over GF(2). On 5,000 pages, the equations were consistent for 13 bits, and for the 14th bit
+with a single exception (the rare variant below). Solving them on 2,000 random pages gave the formula,
+which we then checked on data not used to find it:
+
+| Held-out set | Exact matches |
+|---|---|
+| page ID observations | 58,137 / 58,146 (99.985 %) |
+| distinct page docids | 30,344 / 30,351 |
+| image ID observations | 61,936 / 61,942 (99.990 %) |
+| distinct page and image IDs read in Google pages and app data, 2021–2026 (image grids and viewers, images in "People also ask" answers and in AI Mode, Discover cards, video cards) | 5,194 / 5,194 |
+
+A random 14-bit value matches with probability 1 in 16,384.
+
+**[Observed] Rare variant.** 17 IDs (11 page IDs, 6 image IDs) have the fixed bit not flipped. Their
+docid is right: the 11 page IDs match their URL, and 6 of these docids also appear elsewhere in the normal
+form. All 17 come from image-result links (`/imgres` URLs), none from a page served by Google. We don't
+know what produces them.
+
+**[Observed] Google recomputes the checksum.** We sent 5 requests to Google Images in October 2026. With
+the right URL and docid but a wrong checksum (zeroed, or with one bit flipped), Google returned the page ID
+with the right checksum. With an invented address, or the real address paired with the docid of an
+invented one, it returned no result.
+
+**[Observed] Image IDs use the same format.** `tbnid`, `imgdii` and `data-tbnid` are 64 bits, then the
+same checksum, then `M`. Their first 64 bits are not the fingerprint of the image URL (0 / 22, 0 / 49).
+What they encode is an open question.
+
+**[Interpretation]** The checksum guards against corrupted or truncated IDs, like the check digits of a
+bank account number. It carries no information beyond the docid.
 
 ## 4. Validation results and their limitations
 
@@ -204,7 +252,8 @@ Notes:
 - **[Observed]** In Discover, in 64 cases a card displayed a URL with tracking parameters while its
   identifier matched the bare URL.
 - **[Observed]** The 3 pages we saw both in a Discover card and in Google Images had exactly the same
-  14-character page ID, extra bits included.
+  14-character page ID, extra bits included. This is expected, since the extra bits are computed from the
+  docid (section 3.3).
 
 ### 4.5 Limitations
 
@@ -221,14 +270,14 @@ Notes:
 | Product | Identifier | URL fingerprint? | Detail |
 |---|---|---|---|
 | Search (web results) | docid | **yes** | 2023 and 2026 |
-| Google Images | page ID (`data-ref-docid`) | **yes**, first 64 bits | extra 14 bits unexplained |
-| Google Images | image ID (`tbnid`, `imgdii`, `data-tbnid`) | no | not the fingerprint of the image URL (0 / 22, 0 / 49); `data-docid` is a page ID on some surfaces and an image ID on others |
+| Google Images | page ID (`data-ref-docid`) | **yes**, first 64 bits | then a 14-bit checksum of the docid (section 3.3) |
+| Google Images | image ID (`tbnid`, `imgdii`, `data-tbnid`) | no | not the fingerprint of the image URL (0 / 22, 0 / 49), though it has the page ID format and checksum; `data-docid` is a page ID on some surfaces and an image ID on others |
 | Discover | card identifier, decimal docid | **yes** | `content_numeric_id` is not (0 / 788) |
 | Google News | article docid | **yes** | |
 | Google Shopping | offer, product, catalog, image IDs | no | 0 / 2,071 explicit offer ↔ merchant URL pairs |
 | Google Maps | CID (`ludocid`) | no | 0 / 14,899 candidate URLs; **[Observed]** the CID is the second half of the place ID `0x…:0x…` (2,512 / 2,512) |
 | AI Overviews, AI Mode | source cards | no identifier | no 64-bit value next to sources (0 / 4,729 numbers); images shown in AI Mode carry their page ID |
-| "People also ask" | 14-bit value per question | no | follows the source page (fragment ignored); no function we tested reproduces it from the docid, and no lookup2 seed reproduces it from the URL (all 2<sup>32</sup> seeds tried) |
+| "People also ask" | 14-bit value per question | no | follows the source page (fragment ignored); no function we tested reproduces it from the docid, and no lookup2 seed reproduces it from the URL (all 2<sup>32</sup> seeds tried); it is not the page ID checksum either (0 matches in 36,918 tests) |
 | Gemini | source `docid` | no | issued per response, see section 6 |
 
 **[Interpretation]** Search, Images, Discover and News share one document key: the fingerprint of the
@@ -286,6 +335,9 @@ For technical SEO and search research:
   parameters, fragment.
 - **Joining data across products.** Use the docid as a key to follow one document across Search, Images,
   Discover and News, independently of how each surface writes the URL.
+- **Building and checking page IDs.** `docid.py` computes the 14-character page ID of any URL, so a page
+  can be looked up in Images or Discover data that carries IDs without URLs. `decode` tells a real page ID
+  from a random 14-character string.
 - **Recognizing docids in captured data.** Any 64-bit number in a HAR file, an app capture or an export can
   be tested against candidate URLs, in its signed, unsigned, hex or base64 form.
 - **Reading documentation.** Fields named docid or URL fingerprint in Google's published or leaked
@@ -298,15 +350,18 @@ site from a docid.
 
 1. Which documents have a docid that is *not* the fingerprint of their URL ("usually fingerprint of URL,
    but not always")?
-2. What do the extra 14 bits of Images and Discover page IDs encode? They follow the page, not the image.
+2. What do the first 64 bits of image IDs (`tbnid`) encode? They have the page ID format and checksum,
+   but they are not the fingerprint of the image URL.
 3. What is the 14-bit per-question value in "People also ask"? It follows the source page, but no function
-   we tested reproduces it from the docid.
+   we tested reproduces it from the docid, the page ID checksum included.
 4. How are internationalized host names hashed (Unicode or punycode)?
 5. **[Interpretation, to test]** The Discover and "People also ask" cases suggest that the docid is computed
    on the URL Google retained for the document (without tracking parameters or fragments), not on the
    link as displayed. A systematic test on pages with known canonical URLs would confirm or refute it.
 6. Does Gemini still number its sources per response since the identifier left the visible data in
    May–June 2026?
+7. Do the final `M` and the fixed checksum bit mark a format version? Apart from the rare variant, we
+   only ever saw one value for each.
 
 ## Responsible use
 

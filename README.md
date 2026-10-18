@@ -10,7 +10,7 @@ url             https://en.wikipedia.org/wiki/ChatGPT
 docid unsigned  9301487375180519679
 docid signed    -9145256698529031937
 docid hex       8115857c806a58ff
-page ID prefix  _1hqgHyFFY   (first 10 characters of a Google Images / Discover page ID)
+page ID         _1hqgHyFFYH93M   (14-character ID used by Google Images and Discover)
 ```
 
 ## Key finding
@@ -33,6 +33,7 @@ letter case and percent-encoding are all part of the input.
 | Independent re-check on 79 randomly drawn responses of the same corpus | 765 / 765 results |
 | Page IDs on live Google Images result pages, October 2026 | 1,377 / 1,380 |
 | Google Discover card identifiers, September–October 2026 | 1,482 / 1,545 distinct values resolved (96 %) |
+| Page IDs of Google Images and Discover: the 14 bits after the docid are a checksum of the docid | **58,137 / 58,146** held-out observations; **5,194 / 5,194** IDs read in Google pages and app data |
 | 30+ other hash functions and seed sets tested on 3,000 pairs (FarmHash, CityHash, Fingerprint2011, MurmurHash, FNV, truncated MD5/SHA, the "external" seeds of the same function) | 0 / 3,000 for each |
 
 A random 64-bit match has a probability of about 1 in 1.8 × 10<sup>19</sup>. Every match is exact on all
@@ -77,6 +78,14 @@ That pair was read on a live Google Images page in October 2026 (attribute names
 can change them). If the URL in `data-lpage` contains HTML escapes such as `&amp;`, the `match` command
 also tries the unescaped form.
 
+The tool also rebuilds the whole ID from the URL alone. It prints the exact value of `data-ref-docid`:
+
+```console
+$ python docid.py https://en.wikipedia.org/wiki/Lockheed_Martin_F-22_Raptor
+...
+page ID         DvLY3kr8C0KWkM   (14-character ID used by Google Images and Discover)
+```
+
 ## How it works
 
 ![How a docid is computed from a URL: the same bytes are hashed twice with Bob Jenkins' lookup2 (seeds 0 and 102072) and the two 32-bit halves are concatenated into the 64-bit docid.](docid.png)
@@ -105,11 +114,28 @@ The same 64 bits can be written several ways. Google's own pages and data use mo
 | unsigned decimal | `9301487375180519679` |
 | signed decimal (int64, e.g. Java `long`) | `-9145256698529031937` |
 | hexadecimal | `8115857c806a58ff` |
-| 14-character page ID (Images, Discover): the 8 bytes little-endian in URL-safe base64, followed by 14 more bits | starts with `_1hqgHyFFY` |
+| 14-character page ID (Images, Discover): the 8 bytes little-endian, a 14-bit checksum and `M`, in URL-safe base64 | `_1hqgHyFFYH93M` |
 
-Only the first 10 characters of a page ID are fully determined by the docid. No function we tested
-reproduces the extra 14 bits from the docid or the URL: they are the same for every image of a page and
-differ between pages. We have not identified what they encode.
+### Page IDs: docid plus checksum
+
+A 14-character page ID is the docid, then a 14-bit checksum of the docid, then a constant `M`, in
+URL-safe base64. With `b0` to `b7` the docid bytes, least significant first (the order in which they
+appear in the ID):
+
+```text
+checksum = ((b0 ^ b2 ^ b4 ^ b6 ^ 1) << 6) | ((b1 ^ b3 ^ b5 ^ b7) >> 2)
+page ID  = base64url(8 docid bytes + 14 checksum bits) + "M"
+```
+
+In words: XOR the four byte pairs of the docid, flip one fixed bit, keep the top 14 of the 16 bits.
+
+The checksum depends on the docid alone and adds no information. That is why every image of a page
+carries the same extra bits while two pages of one site carry different ones. The page ID of any URL can
+therefore be computed, and a 14-character string that fails the checksum is not a Google page ID.
+
+Image IDs (`tbnid`) use the same format and the same checksum, but their first 64 bits are not the
+fingerprint of the image URL and we don't know what they are. Details in
+[RESEARCH.md, section 3.3](RESEARCH.md#33-the-page-id-checksum).
 
 ### The input is the exact string
 
@@ -141,9 +167,10 @@ python docid.py https://example.com/
 ## Usage
 
 ```console
-python docid.py URL [URL ...]           # docid of each exact string
+python docid.py URL [URL ...]           # docid and page ID of each exact string
 python docid.py variants URL            # docids of common written forms of a URL
-python docid.py decode ID               # read a decimal, signed, hex or 14-character page ID
+python docid.py decode ID               # read a decimal, signed, hex or 14-character page ID;
+                                        # for a page ID, also check its checksum
 python docid.py match ID URL [URL ...]  # which form of which URL produces this docid
 python docid.py --json ...              # machine-readable output
 python docid.py -- STRING               # hash a string that looks like a command or option
@@ -157,14 +184,16 @@ unescaped, percent-encoded or `https://`-prefixed form; plus the whole URL in lo
 As a library:
 
 ```python
-from docid import docid, to_signed, decode_page_id
+from docid import docid, to_signed, page_id, decode_page_id, page_id_status
 
 docid("https://en.wikipedia.org/wiki/ChatGPT")   # 9301487375180519679
 to_signed(9301487375180519679)                   # -9145256698529031937
+page_id(9301487375180519679)                     # '_1hqgHyFFYH93M'
 decode_page_id("DvLY3kr8C0KWkM")                 # 4759174829743600142
+page_id_status("DvLY3kr8C0KWkM")                 # 'valid'
 ```
 
-Tests: `python -m unittest -v test_docid` (35 tests, standard library only).
+Tests: `python -m unittest -v test_docid` (40 tests, standard library only).
 
 ## Validation
 
@@ -181,6 +210,11 @@ Tests: `python -m unittest -v test_docid` (35 tests, standard library only).
   (1,482 / 1,545 distinct values), Google News article docids (54), docids of videos on Google's store
   pages for merchants (26 / 26) and the docids listed in the data of a live Search results page (7 / 10; the
   URLs of the other 3 were not in the captured data).
+- Page ID checksum: the formula was solved on 2,000 pages and checked on everything else. It reproduces
+  58,137 of 58,146 page ID observations (30,344 of 30,351 distinct docids), 61,936 of 61,942 image ID
+  observations, and all 5,194 distinct page and image IDs read in Google pages and app data from 2021 to
+  2026. Every exception is the same rare variant, with the fixed bit not flipped.
+  Details in [RESEARCH.md, section 3.3](RESEARCH.md#33-the-page-id-checksum).
 
 **Not shown**
 

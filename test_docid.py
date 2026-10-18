@@ -6,7 +6,8 @@ Expected values come from three places:
   2. Collisions documented in Google's gutil source (hash.h). They reproduce only with the
      internal seeds 0 and 102072, which checks the seeds and the byte handling together.
   3. Page IDs observed on live Google Images result pages (October 2026), whose first
-     8 bytes are the docid of the result's source page.
+     8 bytes are the docid of the result's source page and whose next 14 bits are a
+     checksum of that docid, and a Google Discover card identifier (September 2026).
 Other values are regression values computed by this implementation.
 """
 
@@ -100,6 +101,41 @@ class ObservedPageIds(unittest.TestCase):
         self.assertEqual(d.docid(d.percent_encode(raw)), target)
 
 
+class PageIdChecksum(unittest.TestCase):
+    """The 14 bits after the docid in a page ID are a checksum of the docid."""
+
+    DISCOVER = ("https://www.20minutes.fr/auto/4247426-20260922-dacia-regle-comptes-europe", "-n9xItu9-16qvM")
+
+    def test_full_page_id_from_url(self):
+        for url, observed in ObservedPageIds.OBSERVED + [self.DISCOVER]:
+            self.assertEqual(d.page_id(d.docid(url)), observed, url)
+            self.assertEqual(d.page_id_status(observed), "valid", observed)
+
+    def test_formula(self):
+        self.assertEqual(d.page_id_checksum(WIKI_DOCID), 16247)
+        self.assertEqual(d.page_id_checksum(WIKI_DOCID, flip=False), 16247 ^ 64)
+        self.assertEqual(d.page_id(WIKI_DOCID), "_1hqgHyFFYH93M")
+        self.assertEqual(d.page_id(0), "AAAAAAAAAAABAM")
+        self.assertEqual(d.page_id(2**64 - 1), "__________8BAM")
+        for value in (0, 1, WIKI_DOCID, 2**64 - 1):
+            self.assertEqual(d.decode_page_id(d.page_id(value)), value)
+
+    def test_status(self):
+        good = d.page_id(WIKI_DOCID)
+        self.assertEqual(d.page_id_status(good), "valid")
+        flipped = d._B64URL[d._B64URL.index(good[11]) ^ 1]  # fixed bit = low bit of the 12th character
+        variant = good[:11] + flipped + good[12:]
+        self.assertEqual(d.decode_page_id(variant), WIKI_DOCID)
+        self.assertEqual(d.page_id_status(variant), "variant")
+        self.assertEqual(d.page_id_status(good[:12] + "A" + good[13]), "invalid")
+        self.assertEqual(d.page_id_status(good[:13] + "Q"), "invalid")
+        with self.assertRaises(ValueError):
+            d.page_id_status("too short")
+
+    def test_prefix_is_docid_only(self):
+        self.assertEqual(d.page_id_prefix(WIKI_DOCID), d.page_id(WIKI_DOCID)[:10])
+
+
 class ExactStringSemantics(unittest.TestCase):
     """Every written form of an address is a different string, hence a different docid."""
 
@@ -178,7 +214,7 @@ class SixtyFourBitForms(unittest.TestCase):
                            ("-9145256698529031937", "signed decimal"),
                            ("0x8115857c806a58ff", "hexadecimal"),
                            ("8115857c806a58ff", "hexadecimal"),
-                           ("_1hqgHyFFYEAAM", "14-character page ID")]:
+                           ("_1hqgHyFFYH93M", "14-character page ID")]:
             self.assertEqual(d.parse_identifier(text), (WIKI_DOCID, form), text)
         for bad in ("", "abc", "18446744073709551616", "-9223372036854775809", "0x" + "f" * 17,
                     "not a page id!", "DvLY3kr8C0KWk", "٣٤٥"):
@@ -262,8 +298,17 @@ class Cli(unittest.TestCase):
     def test_decode(self):
         code, out, _ = run_cli("decode", "--json", "DvLY3kr8C0KWkM")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["unsigned"],
-                         d.docid("https://en.wikipedia.org/wiki/Lockheed_Martin_F-22_Raptor"))
+        rec = json.loads(out)
+        self.assertEqual(rec["unsigned"], d.docid("https://en.wikipedia.org/wiki/Lockheed_Martin_F-22_Raptor"))
+        self.assertEqual(rec["checksum"], "valid")
+        code, out, _ = run_cli("decode", "DvLY3kr8C0KWAM")
+        self.assertEqual(code, 0)
+        self.assertIn("does not match", out)
+
+    def test_url_prints_page_id(self):
+        code, out, _ = run_cli(WIKI)
+        self.assertEqual(code, 0)
+        self.assertIn("_1hqgHyFFYH93M", out)
 
     def test_non_ascii_note(self):
         code, out, _ = run_cli("https://fr.wikipedia.org/wiki/Économie")

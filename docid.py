@@ -22,18 +22,23 @@ fragment, letter case and percent-encoding all change the result. This module ne
 normalizes a URL silently; the `variants` and `match` commands list labeled variants
 explicitly.
 
+Google Images and Discover write a docid as a 14-character page ID: the 8 bytes of the
+docid (little-endian), a 14-bit checksum of those bytes, then a constant "M", in URL-safe
+base64. With b0..b7 the docid bytes in that order:
+
+    checksum = ((b0 ^ b2 ^ b4 ^ b6 ^ 1) << 6) | ((b1 ^ b3 ^ b5 ^ b7) >> 2)
+
 Usage:
-    python docid.py URL [URL ...]          docid of each exact string
+    python docid.py URL [URL ...]          docid and page ID of each exact string
     python docid.py variants URL           docids of common variants of a URL
     python docid.py decode ID              read a docid (decimal, signed, hex) or a
-                                           14-character Google page ID
+                                           14-character Google page ID (checksum verified)
     python docid.py match ID URL [URL ...] find which variant of which URL gives this docid
     add --json to any command for machine-readable output
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import re
 import sys
@@ -41,8 +46,8 @@ from urllib.parse import urlsplit
 
 __all__ = [
     "FINGERPRINT_SEED0", "FINGERPRINT_SEED1", "jenkins32", "fingerprint", "docid",
-    "to_signed", "to_unsigned", "page_id_prefix", "decode_page_id", "parse_identifier",
-    "percent_encode", "url_variants",
+    "to_signed", "to_unsigned", "page_id", "page_id_checksum", "page_id_status", "page_id_prefix",
+    "decode_page_id", "parse_identifier", "percent_encode", "url_variants",
 ]
 
 M32 = 0xFFFFFFFF
@@ -160,25 +165,67 @@ def to_unsigned(value: int) -> int:
     return value & M64
 
 
-def page_id_prefix(value: int) -> str:
-    """First 10 characters of the 14-character page ID used by Google Images and Discover.
+_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
-    Those IDs start with the page docid written as 8 little-endian bytes in URL-safe base64.
-    Only the first 10 characters depend on the docid alone.
+
+def page_id_checksum(value: int, *, flip: bool = True) -> int:
+    """14-bit checksum that follows the docid in a 14-character page ID.
+
+    XOR of the four 16-bit pairs of docid bytes (little-endian order), with one fixed bit
+    flipped, keeping the top 14 bits. flip=False gives a rare variant (see page_id_status).
     """
-    return base64.urlsafe_b64encode(to_unsigned(value).to_bytes(8, "little")).decode("ascii")[:10]
+    b = to_unsigned(value).to_bytes(8, "little")
+    return (((b[0] ^ b[2] ^ b[4] ^ b[6] ^ int(flip)) << 6)
+            | ((b[1] ^ b[3] ^ b[5] ^ b[7]) >> 2))
+
+
+def page_id(value: int) -> str:
+    """14-character page ID used by Google Images and Discover (data-ref-docid, docFingerprint).
+
+    URL-safe base64 of 78 bits (the 8 docid bytes, little-endian, then the 14-bit checksum),
+    followed by a constant "M".
+    """
+    bits = (int.from_bytes(to_unsigned(value).to_bytes(8, "little"), "big") << 14) | page_id_checksum(value)
+    return "".join(_B64URL[(bits >> (72 - 6 * i)) & 63] for i in range(13)) + "M"
+
+
+def page_id_prefix(value: int) -> str:
+    """First 10 characters of the page ID: the part made of docid bits only."""
+    return page_id(value)[:10]
 
 
 _PAGE_ID_RE = re.compile(r"[A-Za-z0-9_-]{14}")
 _SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
 
-def decode_page_id(page_id: str) -> int:
-    """Page docid carried by a 14-character Google page ID (e.g. data-ref-docid in Google Images)."""
+def _split_page_id(page_id: str) -> tuple[int, int]:
     if not _PAGE_ID_RE.fullmatch(page_id or ""):
         raise ValueError("a page ID is 14 URL-safe base64 characters, got %r" % page_id)
-    raw = base64.urlsafe_b64decode(page_id[:12])  # 12 characters = 9 bytes
-    return int.from_bytes(raw[:8], "little")
+    bits = 0
+    for ch in page_id[:13]:
+        bits = (bits << 6) | _B64URL.index(ch)
+    return int.from_bytes((bits >> 14).to_bytes(8, "big"), "little"), bits & 0x3FFF
+
+
+def decode_page_id(page_id: str) -> int:
+    """Page docid carried by a 14-character Google page ID (e.g. data-ref-docid in Google Images).
+
+    The checksum is not verified here; use page_id_status() for that.
+    """
+    return _split_page_id(page_id)[0]
+
+
+def page_id_status(page_id: str) -> str:
+    """'valid' when the checksum and the final "M" match the docid; 'variant' for the rare form
+    whose fixed checksum bit is not flipped (seen only in image-result links, never in pages
+    served by Google); 'invalid' otherwise.
+    """
+    value, checksum = _split_page_id(page_id)
+    if page_id[13] == "M" and checksum == page_id_checksum(value):
+        return "valid"
+    if page_id[13] == "M" and checksum == page_id_checksum(value, flip=False):
+        return "variant"
+    return "invalid"
 
 
 def parse_identifier(text: str) -> tuple[int, str]:
@@ -293,6 +340,7 @@ def _forms(value: int) -> dict:
         "unsigned": value,
         "signed": to_signed(value),
         "hex": "%016x" % value,
+        "page_id": page_id(value),
         "page_id_prefix": page_id_prefix(value),
     }
 
@@ -318,7 +366,7 @@ def _print_record(rec: dict) -> None:
     print("docid unsigned  %d" % rec["unsigned"])
     print("docid signed    %d" % rec["signed"])
     print("docid hex       %s" % rec["hex"])
-    print("page ID prefix  %s   (first 10 characters of a Google Images / Discover page ID)" % rec["page_id_prefix"])
+    print("page ID         %s   (14-character ID used by Google Images and Discover)" % rec["page_id"])
     for note in rec.get("notes", []):
         print("note            %s" % note)
 
@@ -360,6 +408,8 @@ def _cmd_decode(args: list[str], as_json: bool) -> int:
         raise ValueError("decode takes exactly one identifier")
     value, form = parse_identifier(args[0])
     rec = {"input": args[0], "form": form, **_forms(value)}
+    if form == "14-character page ID":
+        rec["checksum"] = page_id_status(args[0].strip())
     if as_json:
         print(json.dumps(rec, indent=2))
     else:
@@ -367,7 +417,13 @@ def _cmd_decode(args: list[str], as_json: bool) -> int:
         print("docid unsigned  %d" % value)
         print("docid signed    %d" % rec["signed"])
         print("docid hex       %s" % rec["hex"])
-        print("page ID prefix  %s" % rec["page_id_prefix"])
+        print("page ID         %s" % rec["page_id"])
+        if "checksum" in rec:
+            print("checksum        %s" % {
+                "valid": "valid",
+                "variant": "rare variant (fixed bit not flipped); same docid",
+                "invalid": "does not match: probably not a Google page ID",
+            }[rec["checksum"]])
     return 0
 
 
